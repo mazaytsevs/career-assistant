@@ -8,7 +8,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logger = setup_logger(__name__)
 
-def send_message(text: str):
+async def send_message(text: str):
     """
     Отправляет сообщение в Telegram и логирует это.
     """
@@ -22,8 +22,8 @@ def send_message(text: str):
             
         logger.info(f"Попытка отправки сообщения с токеном: {TOKEN[:5]}... и chat_id: {CHAT_ID}")
         bot = Bot(token=TOKEN)
-        bot.send_message(chat_id=CHAT_ID, text=text)
+        await bot.send_message(chat_id=CHAT_ID, text=text)
         logger.info(f"Сообщение успешно отправлено: {text}")
     except Exception as e:
         logger.error(f"Ошибка при отправке сообщения: {str(e)}")
-        logger.error(f"Тип ошибки: {type(e).__name__}") 
+        logger.error(f"Тип ошибки: {type(e).__name__}")
