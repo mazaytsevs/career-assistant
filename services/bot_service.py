@@ -1,5 +1,9 @@
 import os
 import asyncio
+import tempfile
+from services.pdf_parser_service import pdf_to_text
+from services.rag_match_service import index_resume_if_needed
+import uuid
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -150,10 +154,45 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.document:
         file_obj = await update.message.document.get_file()
         file_bytes = await file_obj.download_as_bytearray()
-        context.user_data["resume"] = file_bytes.decode("utf-8", errors="ignore")
+        file_name = update.message.document.file_name or ""
+        # --- PDF branch ---
+        if file_name.lower().endswith(".pdf"):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            try:
+                resume_text = pdf_to_text(tmp_path)
+            except Exception as exc:
+                logger.error("Ошибка pdf_to_text: %s", exc)
+                resume_text = ""
+            context.user_data["resume"] = resume_text
+            logger.info(
+                "Резюме (PDF) извлечено, первые 200 символов: %s…",
+                resume_text[:200]
+            )
+            # --- RAG indexing ---
+            resume_id = index_resume_if_needed(resume_text, user_id=update.message.chat.id)
+            logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
+            await update.message.reply_text("Резюме успешно сохранено.")
+        # --- fallback: обычный текстовый файл ---
+        else:
+            context.user_data["resume"] = file_bytes.decode("utf-8", errors="ignore")
+            logger.info(
+                "Резюме (файл) получено: %s…",
+                str(context.user_data["resume"])[:200]
+            )
+            # --- RAG indexing ---
+            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
+            await update.message.reply_text("Резюме успешно сохранено.")
     else:
         txt = update.message.text or ""
         context.user_data["resume"] = None if txt.lower().strip() == "нет" else txt
+        logger.info(f"Резюме (текст) получено: {str(context.user_data['resume'])[:200]}…")
+        if context.user_data["resume"]:
+            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
+            await update.message.reply_text("Резюме успешно сохранено.")
 
     await update.message.reply_text("Ищу подходящие вакансии, подожди пару секунд…")
 
