@@ -1,4 +1,14 @@
 import httpx
+from typing import List, Dict
+
+def get_vacancy_details(vacancy_id: int | str) -> Dict:
+    """
+    Получает полный JSON вакансии, включая description и key_skills.
+    """
+    url = f"https://api.hh.ru/vacancies/{vacancy_id}"
+    response = httpx.get(url)
+    response.raise_for_status()
+    return response.json()
 
 def search_vacancies(
     text: str,
@@ -6,8 +16,9 @@ def search_vacancies(
     experience: str = None,
     employment: str = None,
     schedule: str = None,
-    page: int = 1,
-    per_page: int = 20
+    page: int = 0,
+    per_page: int = 20,
+    enrich: bool = False
 ):
     """
     Выполняет поиск вакансий на hh.ru по заданным фильтрам.
@@ -19,6 +30,7 @@ def search_vacancies(
     :param schedule: График работы ('remote', 'fullDay', 'shift', и т.д.)
     :param page: Номер страницы результатов
     :param per_page: Кол-во результатов на странице
+    :param enrich: Если True, добавляет описание и ключевые навыки к каждой вакансии
     :return: JSON с результатами поиска
     """
     url = "https://api.hh.ru/vacancies"
@@ -39,7 +51,22 @@ def search_vacancies(
 
     response = httpx.get(url, params=params)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+
+    if enrich:
+        enriched_items: List[Dict] = []
+        for it in data.get("items", []):
+            try:
+                details = get_vacancy_details(it["id"])
+                it["description"] = details.get("description", "")
+                it["key_skills"] = details.get("key_skills", [])
+            except Exception:
+                # если запрос деталей упал, пропускаем без enrichment
+                pass
+            enriched_items.append(it)
+        data["items"] = enriched_items
+
+    return data
 
 
 if __name__ == "__main__":
@@ -49,9 +76,12 @@ if __name__ == "__main__":
     result = search_vacancies(
         text="node js backend разработчик",
         experience="between3And6",
-        schedule="remote"
+        schedule="remote",
+        enrich=True
     )
 
     for item in result.get("items", []):
         logging.info(f"{item['name']} — {item['employer']['name']}")
+        if item.get("key_skills"):
+            logging.info("Skills: %s", ", ".join(k['name'] for k in item['key_skills']))
         logging.info(f"URL: {item['alternate_url']}\n")

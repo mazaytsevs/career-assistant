@@ -2,7 +2,6 @@ import os
 import asyncio
 import tempfile
 from services.pdf_parser_service import pdf_to_text
-from services.rag_match_service import index_resume_if_needed
 import uuid
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -17,6 +16,10 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from config.logger import setup_logger
 from services.message_service import send_message
+
+# --- Additional imports for RAG matching ---
+import json
+from services.rag_match_service import index_resume_if_needed, ask_resume
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -41,6 +44,9 @@ SCHEDULE_MAP = {
     "Сменный график": "shift",
     "Без разницы": None,
 }
+
+# Показываем вакансии с мэтчем ≥ 50 %
+MATCH_THRESHOLD = 0.5  # показываем вакансии с мэтчем ≥ 50 %
 
 def check_environment():
     """Проверка необходимых переменных окружения"""
@@ -171,7 +177,9 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resume_text[:200]
             )
             # --- RAG indexing ---
-            resume_id = index_resume_if_needed(resume_text, user_id=update.message.chat.id)
+            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
+            index_resume_if_needed(resume_text, user_id=update.message.chat.id)
+            context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
         # --- fallback: обычный текстовый файл ---
@@ -182,7 +190,9 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 str(context.user_data["resume"])[:200]
             )
             # --- RAG indexing ---
-            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
+            index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
     else:
@@ -190,7 +200,9 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["resume"] = None if txt.lower().strip() == "нет" else txt
         logger.info(f"Резюме (текст) получено: {str(context.user_data['resume'])[:200]}…")
         if context.user_data["resume"]:
-            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
+            index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
 
@@ -202,16 +214,39 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=context.user_data["keywords"],
         experience=context.user_data["experience"],
         schedule=context.user_data["schedule"],
-        per_page=10
+        per_page=20,
+        enrich=True
     )
 
-    items = vacancies.get("items", [])[:5]
-    if not items:
-        await update.message.reply_text("К сожалению, ничего не нашёл 😔")
+    # RAG-based filtering by match score
+    resume_id = context.user_data.get("resume_id")
+    items = vacancies.get("items", [])
+    good_items = []
+    for v in items:
+        vac_text = f"{v['name']}\n{v.get('description','')}"
+        try:
+            resp = ask_resume(
+                f"Оцени пригодность кандидата для вакансии (0-1). "
+                f"Верни JSON, только поле match.\n\n{vac_text}",
+                resume_id
+            )
+            score_json = json.loads(resp)
+            score = float(score_json.get("match", 0))
+        except Exception:
+            score = 0.0
+        if score >= MATCH_THRESHOLD:
+            v["match_score"] = score
+            good_items.append(v)
+
+    if not good_items:
+        await update.message.reply_text("Ничего подходящего не нашёл 😔")
     else:
-        reply_parts = []
-        for v in items:
-            reply_parts.append(f"{v['name']} — {v['employer']['name']}\n{v['alternate_url']}")
+        # сортируем по убыванию пригодности
+        good_items.sort(key=lambda x: x["match_score"], reverse=True)
+        reply_parts = [
+            f"🔹 {it['name']} — {it['match_score']:.0%}\n{it['alternate_url']}"
+            for it in good_items[:5]
+        ]
         await update.message.reply_text("\n\n".join(reply_parts))
 
     # Можно отправить лог в личный чат (пример)
