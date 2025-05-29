@@ -54,3 +54,8 @@ logs/
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Chroma DB files
+data/chroma_resume/
+*.bin
+*.sqlite3
