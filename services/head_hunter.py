@@ -1,5 +1,5 @@
 import httpx
-from typing import List, Dict
+from typing import List, Dict, Any
 
 def get_vacancy_details(vacancy_id: int | str) -> Dict:
     """
@@ -12,42 +12,49 @@ def get_vacancy_details(vacancy_id: int | str) -> Dict:
 
 def search_vacancies(
     text: str,
-    area: int = None,
-    experience: str = None,
-    employment: str = None,
-    schedule: str = None,
+    experience: str,
+    employment: str,
+    area: int | None = None,
+    schedule: str | None = None,
+    salary: int | None = None,
     page: int = 0,
-    per_page: int = 20,
-    enrich: bool = False
+    per_page: int = 100,
+    enrich: bool = False,
+    **extra_filters: Dict[str, Any]
 ):
     """
     Выполняет поиск вакансий на hh.ru по заданным фильтрам.
 
-    :param text: Ключевые слова для поиска
-    :param area: Регион (по умолчанию 1 — Москва)
-    :param experience: Опыт работы ('noExperience', 'between1And3', 'between3And6', 'moreThan6')
-    :param employment: Тип занятости ('full', 'part', 'project', 'volunteer', 'probation')
-    :param schedule: График работы ('remote', 'fullDay', 'shift', и т.д.)
-    :param page: Номер страницы результатов
-    :param per_page: Кол-во результатов на странице
+    :param text: (обязательно) Ключевые слова для поиска
+    :param experience: (обязательно) Опыт работы ('noExperience', 'between1And3', 'between3And6', 'moreThan6')
+    :param employment: (обязательно) Тип занятости ('full', 'part', 'project', 'volunteer', 'probation')
+    :param area: (опц.) Регион (по умолчанию None)
+    :param schedule: (опц.) График работы ('remote', 'fullDay', 'shift', и т.д.)
+    :param salary: (опц.) Минимальная зарплата (целое число)
+    :param page: Номер страницы результатов (по умолчанию 0)
+    :param per_page: Кол-во результатов на странице (по умолчанию 100)
     :param enrich: Если True, добавляет описание и ключевые навыки к каждой вакансии
+    :param extra_filters: Дополнительные фильтры для API
     :return: JSON с результатами поиска
     """
     url = "https://api.hh.ru/vacancies"
     params = {
         "text": text,
+        "experience": experience,
+        "employment": employment,
         "page": page,
         "per_page": per_page
     }
 
     if area is not None:
         params["area"] = area
-    if experience:
-        params["experience"] = experience
-    if employment:
-        params["employment"] = employment
     if schedule:
         params["schedule"] = schedule
+    if salary is not None:
+        params["salary"] = salary
+
+    for key, value in extra_filters.items():
+        params[key] = value
 
     response = httpx.get(url, params=params)
     response.raise_for_status()
@@ -76,6 +83,7 @@ if __name__ == "__main__":
     result = search_vacancies(
         text="node js backend разработчик",
         experience="between3And6",
+        employment="full",
         schedule="remote",
         enrich=True
     )

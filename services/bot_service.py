@@ -5,6 +5,8 @@ from services.pdf_parser_service import pdf_to_text
 import uuid
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import BotCommand
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,7 +21,13 @@ from services.message_service import send_message
 
 # --- Additional imports for RAG matching ---
 import json
-from services.rag_match_service import index_resume_if_needed, ask_resume
+from services.rag_match_service import index_resume_if_needed
+
+from services.resume_vacancy_matcher import (
+    parse_resume,
+    parse_vacancy,
+    match_resume_to_vacancy,
+)
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,7 +35,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logger = setup_logger(__name__)
 
 # Conversation states for /find_job command
-KEYWORDS, EXPERIENCE, SCHEDULE, RESUME = range(4)
+KEYWORDS, EXPERIENCE, EMPLOYMENT, SCHEDULE, SALARY, PREFS, RESUME = range(7)
 
 # Читаемые лейблы → значения, которые ждёт HH API
 EXPERIENCE_MAP = {
@@ -45,6 +53,18 @@ SCHEDULE_MAP = {
     "Без разницы": None,
 }
 
+# Тип занятости
+EMPLOYMENT_MAP = {
+    "Полная занятость": "full",
+    "Частичная занятость": "part",
+    "Проектная работа": "project",
+    "Волонтёрство": "volunteer",
+    "Стажировка": "probation",
+}
+
+# Максимальная длина текста вакансии для GigaChat (≈ 300 токенов)
+MAX_VACANCY_CHARS = 1000
+
 # Показываем вакансии с мэтчем ≥ 50 %
 MATCH_THRESHOLD = 0.5  # показываем вакансии с мэтчем ≥ 50 %
 
@@ -59,15 +79,24 @@ def check_environment():
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    await update.message.reply_text("Привет! Я бот для помощи в карьере. Чем могу помочь?")
+    text = (
+        "Привет! Я бот для помощи в карьере.\n\n"
+        "• /find_job — подобрать вакансии под твоё резюме\n"
+        "• /help — подсказка по всем командам"
+    )
+    await update.message.reply_text(
+        escape_markdown(text, version=2),
+        parse_mode="MarkdownV2"
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
-    help_text = """
-    Доступные команды:
-    /start - Начать работу с ботом
-    /help - Показать это сообщение
-    """
+    help_text = (
+        "Доступные команды:\n"
+        "/start — начать работу\n"
+        "/find_job — подобрать вакансии\n"
+        "/help — показать это сообщение"
+    )
     await update.message.reply_text(help_text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -107,10 +136,13 @@ async def send_startup_message(application: Application):
 # --- Conversation handler for /find_job ---
 async def hh_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 0 — старт команды /find_job"""
-    await update.message.reply_text(
+    text = (
         "Давай подберём вакансии!\n"
-        "Сначала напиши ключевые слова, например: *Node.js developer*",
-        parse_mode="Markdown"
+        "Сначала напиши ключевые слова, например: Node.js developer"
+    )
+    await update.message.reply_text(
+        escape_markdown(text, version=2),
+        parse_mode="MarkdownV2"
     )
     return KEYWORDS
 
@@ -133,6 +165,25 @@ async def hh_experience(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip()
     context.user_data["experience"] = EXPERIENCE_MAP.get(user_input)
     keyboard = [
+        ["Полная занятость", "Частичная занятость"],
+        ["Проектная работа", "Волонтёрство"],
+        ["Стажировка"]
+    ]
+    await update.message.reply_text(
+        "Выбери тип занятости:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard, resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return EMPLOYMENT
+
+
+# --- New handler for employment type ---
+async def hh_employment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    context.user_data["employment"] = EMPLOYMENT_MAP.get(user_input)
+    # график работы
+    keyboard = [
         ["Удалёнка", "Полный день"],
         ["Сменный график", "Без разницы"]
     ]
@@ -147,11 +198,49 @@ async def hh_experience(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def hh_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip()
     context.user_data["schedule"] = SCHEDULE_MAP.get(user_input)
+    keyboard = [
+        ["150000", "200000", "250000"],
+        ["Без разницы"]
+    ]
     await update.message.reply_text(
-        "Пришли своё резюме *текстом* или *файлом*. "
-        "Если пропустить шаг — напиши `нет`.",
+        "Минимальная зарплата в рублях (можешь ввести число вручную или нажми «Без разницы»):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard, resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return SALARY
+
+
+# --- New handler for salary ---
+async def hh_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    if user_input.lower() == "без разницы":
+        context.user_data["salary"] = None
+    else:
+        try:
+            context.user_data["salary"] = int(user_input.replace("k", "").replace("K", "").replace(" ", ""))
+        except ValueError:
+            context.user_data["salary"] = None
+    await update.message.reply_text(
+        "Опиши, что для тебя важно в вакансии (одно‑два предложения).\n"
+        "Например: «не хочу фронтенд», «нужна сильная соцпакет», «только ИП‑оформление».\n"
+        "Если нет пожеланий — напиши «нет».",
         reply_markup=ReplyKeyboardRemove(),
-        parse_mode="Markdown"
+    )
+    return PREFS
+
+
+# --- New handler for candidate preferences ---
+async def hh_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prefs = update.message.text or ""
+    context.user_data["prefs"] = "" if prefs.lower().strip() == "нет" else prefs
+    text = (
+        "Пришли своё резюме текстом или файлом. "
+        "Если хочешь пропустить шаг — напиши «нет»."
+    )
+    await update.message.reply_text(
+        escape_markdown(text, version=2),
+        parse_mode="MarkdownV2"
     )
     return RESUME
 
@@ -177,8 +266,7 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resume_text[:200]
             )
             # --- RAG indexing ---
-            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
-            index_resume_if_needed(resume_text, user_id=update.message.chat.id)
+            resume_id = index_resume_if_needed(resume_text, user_id=update.message.chat.id)
             context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
@@ -190,8 +278,7 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 str(context.user_data["resume"])[:200]
             )
             # --- RAG indexing ---
-            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
-            index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
             context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
@@ -200,8 +287,7 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["resume"] = None if txt.lower().strip() == "нет" else txt
         logger.info(f"Резюме (текст) получено: {str(context.user_data['resume'])[:200]}…")
         if context.user_data["resume"]:
-            resume_id = f"{update.message.chat.id}_{uuid.uuid4().hex[:8]}"
-            index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
+            resume_id = index_resume_if_needed(context.user_data["resume"], user_id=update.message.chat.id)
             context.user_data["resume_id"] = resume_id
             logger.info("Резюме сохранено в векторной базе под ID=%s", resume_id)
             await update.message.reply_text("Резюме успешно сохранено.")
@@ -213,41 +299,66 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vacancies = search_vacancies(
         text=context.user_data["keywords"],
         experience=context.user_data["experience"],
+        employment=context.user_data["employment"],
         schedule=context.user_data["schedule"],
+        salary=context.user_data.get("salary"),
         per_page=20,
         enrich=True
     )
 
-    # RAG-based filtering by match score
-    resume_id = context.user_data.get("resume_id")
+    # Структурируем резюме для мэтчинга
+    resume_struct = parse_resume(context.user_data.get("resume") or "")
+
+    # --- Мэтчинг резюме ↔ вакансий ---
     items = vacancies.get("items", [])
     good_items = []
+
+    prefs_text = context.user_data.get("prefs", "")
+
     for v in items:
-        vac_text = f"{v['name']}\n{v.get('description','')}"
-        try:
-            resp = ask_resume(
-                f"Оцени пригодность кандидата для вакансии (0-1). "
-                f"Верни JSON, только поле match.\n\n{vac_text}",
-                resume_id
-            )
-            score_json = json.loads(resp)
-            score = float(score_json.get("match", 0))
-        except Exception:
-            score = 0.0
+        # Собираем текст вакансии
+        vac_raw = f"{v['name']}\n{v.get('description') or ''}"
+        vacancy_struct = parse_vacancy(vac_raw)
+        vacancy_struct["raw_text"] = vac_raw  # для проверки prefs
+
+        # 3) Считаем мэтч
+        match = match_resume_to_vacancy(
+            resume_struct,
+            vacancy_struct,
+            prefs_text=prefs_text
+        )
+        score = match["score"]
+
         if score >= MATCH_THRESHOLD:
             v["match_score"] = score
+            v["matched_skills"] = match["matched_skills"]
+            v["missing_skills"] = match["missing_skills"]
             good_items.append(v)
 
     if not good_items:
         await update.message.reply_text("Ничего подходящего не нашёл 😔")
     else:
-        # сортируем по убыванию пригодности
+        # Покажем топ‑5, по одному сообщению, чтобы не превысить лимит 4096 символов
         good_items.sort(key=lambda x: x["match_score"], reverse=True)
-        reply_parts = [
-            f"🔹 {it['name']} — {it['match_score']:.0%}\n{it['alternate_url']}"
-            for it in good_items[:5]
-        ]
-        await update.message.reply_text("\n\n".join(reply_parts))
+        for it in good_items[:5]:
+            percent = it["match_score"]
+            emoji = "🟢" if percent >= 0.80 else ("🟡" if percent >= 0.50 else "🔴")
+            name_md = escape_markdown(it['name'], version=2)
+            ms_md = escape_markdown(", ".join(it.get("matched_skills", []) or ["—"]), version=2)
+            miss_md = escape_markdown(", ".join(it.get("missing_skills", []) or ["—"]), version=2)
+            url_md = escape_markdown(it['alternate_url'], version=2)
+            percent_md = escape_markdown(f"{int(percent*100)}%", version=2)
+
+            text_md = (
+                f"{emoji} *{name_md}*\n"
+                f"{percent_md} мэтча\n"
+                f"Совпало: {ms_md}\n"
+                f"Не хватает: {miss_md}\n"
+                f"[Ссылка на вакансию]({url_md})"
+            )
+
+            # Отправляем каждую вакансию отдельным сообщением
+            await update.message.reply_text(text_md, parse_mode="MarkdownV2")
 
     # Можно отправить лог в личный чат (пример)
     await send_message(f"Пользователь {update.message.chat.id} завершил поиск вакансий.")
@@ -258,11 +369,23 @@ async def hh_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Поиск отменён.")
     return ConversationHandler.END
 
+async def set_bot_commands(app: Application):
+    """Регистрируем список команд, чтобы они появились в меню Telegram‑клиента."""
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Начать"),
+            BotCommand("help", "Помощь"),
+            BotCommand("find_job", "Подобрать вакансии"),
+        ]
+    )
+
 def run_bot():
     """Запуск бота с автоматическим управлением циклом событий"""
     check_environment()
     logger.info("Создание приложения бота...")
     application = Application.builder().token(TOKEN).build()
+
+    application.post_init = set_bot_commands
 
     application.add_handler(CommandHandler('start', start_command))
     application.add_handler(CommandHandler('help', help_command))
@@ -272,7 +395,10 @@ def run_bot():
         states={
             KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_keywords)],
             EXPERIENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_experience)],
+            EMPLOYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_employment)],
             SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_schedule)],
+            SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_salary)],
+            PREFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_prefs)],
             RESUME: [MessageHandler(~filters.COMMAND, hh_resume)],
         },
         fallbacks=[CommandHandler('cancel', hh_cancel)],
