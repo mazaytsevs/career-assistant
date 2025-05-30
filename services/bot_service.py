@@ -23,7 +23,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from config.logger import setup_logger
 from services.message_service import send_message
-from services.head_hunter import search_vacancies, get_resume_list, get_resume_details
+from services.head_hunter import search_vacancies, get_resume_list, get_resume_details, get_vacancy_details
 from services.resume_vacancy_matcher import match_resume_to_vacancy
 from services.vector_store import index_resume, search_similar_resumes
 from config.hh_config import (
@@ -44,6 +44,8 @@ from services.resume_vacancy_matcher import (
     match_resume_to_vacancy,
 )
 
+from services.gigachat_service import generate_cover_letter
+
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -51,6 +53,7 @@ logger = setup_logger(__name__)
 
 WAITING_FOR_RESUME, WAITING_FOR_HH_AUTH_CODE = range(2)          # 0, 1
 KEYWORDS, EXPERIENCE, EMPLOYMENT, SCHEDULE, SALARY, PREFS, RESUME = range(2, 9)  # 2–8
+WAITING_FOR_COVER_LETTER = 9  # Новое состояние для ожидания сопроводительного письма
 
 # Читаемые лейблы → значения, которые ждёт HH API
 EXPERIENCE_MAP = {
@@ -204,7 +207,7 @@ async def hh_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.effective_message.reply_text(
                 "Произошла ошибка при обработке запроса. Попробуйте еще раз или используйте /start"
             )
-        return ConversationHandler.END
+        return WAITING_FOR_RESUME
 
 async def handle_auth_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик получения кода авторизации"""
@@ -495,7 +498,7 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         good_items.sort(key=lambda x: x["match_score"], reverse=True)
         for it in good_items[:5]:
             percent = it["match_score"]
-            title_percent = it.get("title_score", 0)  # Получаем скор заголовка
+            title_percent = it.get("title_score", 0)
             emoji = "🟢" if percent >= 0.80 else ("🟡" if percent >= 0.50 else "🔴")
             name_md = escape_markdown(it['name'], version=2)
             ms_md = escape_markdown(", ".join(it.get("matched_skills", []) or ["—"]), version=2)
@@ -512,12 +515,171 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"[Ссылка на вакансию]({url_md})"
             )
 
+            # Создаем клавиатуру с кнопкой "ОТКЛИКНУТЬСЯ"
+            keyboard = [[InlineKeyboardButton("📝 ОТКЛИКНУТЬСЯ", callback_data=f"show_vacancy:{it['id']}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
             # Отправляем каждую вакансию отдельным сообщением
-            await update.message.reply_text(text_md, parse_mode="MarkdownV2")
+            await update.message.reply_text(text_md, parse_mode="MarkdownV2", reply_markup=reply_markup)
 
     # Можно отправить лог в личный чат (пример)
     await send_message(f"Пользователь {update.message.chat.id} завершил поиск вакансий.")
 
+    return WAITING_FOR_RESUME
+
+async def show_vacancy_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показывает детали вакансии и предлагает написать сопроводительное письмо"""
+    query = update.callback_query
+    await query.answer()
+
+    # --- Логируем и валидируем callback_data ---
+    cb_data = query.data
+    logger.info("show_vacancy_details: callback_data=%s", cb_data)
+
+    # Проверяем формат
+    if ':' not in cb_data:
+        await query.message.reply_text("Не удалось распознать выбранную вакансию.")
+        return WAITING_FOR_RESUME
+
+    vacancy_id = cb_data.split(':')[1]
+
+    # Пробуем получить детали вакансии
+    try:
+        vacancy = get_vacancy_details(vacancy_id)
+    except Exception as exc:
+        logger.error("get_vacancy_details error id=%s: %s", vacancy_id, exc)
+        await query.message.reply_text(
+            "❌ Не удалось получить детали вакансии. Попробуйте позже или выберите другую."
+        )
+        return WAITING_FOR_RESUME
+
+    if not vacancy:
+        await query.message.reply_text(
+            "Вакансия не найдена. Возможно, она уже закрыта."
+        )
+        return WAITING_FOR_RESUME
+
+    # Сохраняем ID вакансии
+    context.user_data["current_vacancy_id"] = vacancy_id
+
+    # Собираем текст
+    name = escape_markdown(vacancy.get("name", "Без названия"), version=2)
+    employer = escape_markdown(vacancy.get("employer", {}).get("name", "Не указано"), version=2)
+
+    salary_obj = vacancy.get("salary") or {}
+    salary_from = salary_obj.get("from")
+    salary_to = salary_obj.get("to")
+    salary_currency = salary_obj.get("currency", "RUR")
+    if salary_from or salary_to:
+        salary_txt = f"{salary_from or ''}–{salary_to or ''} {salary_currency}"
+    else:
+        salary_txt = "Не указана"
+
+    description = escape_markdown(
+        vacancy.get("description", "Нет описания"), version=2
+    )[:MAX_VACANCY_CHARS]
+
+    requirement = escape_markdown(
+        vacancy.get("snippet", {}).get("requirement", "Не указаны"), version=2
+    )
+
+    text = (
+        f"*{name}*\n\n"
+        f"Компания: {employer}\n"
+        f"Зарплата: {salary_txt}\n\n"
+        f"*Описание:* \n{description}\n\n"
+        f"*Требования:* \n{requirement}\n\n"
+        f"Хотите написать сопроводительное письмо?"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✍️ Написать самому", callback_data=f"write_cover:{vacancy_id}"),
+            InlineKeyboardButton("🤖 Сгенерировать с AI", callback_data=f"generate_cover:{vacancy_id}"),
+        ],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_cover")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="MarkdownV2")
+    return WAITING_FOR_COVER_LETTER
+async def handle_cover_letter_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает выбор способа написания сопроводительного письма или отмену"""
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data.split(':')[0]  # write_cover, generate_cover, cancel_cover
+    vacancy_id = context.user_data.get('current_vacancy_id')
+
+    # Отмена
+    if action == 'cancel_cover':
+        await query.message.reply_text(
+            "Окей, вернулись к списку вакансий. Используйте /start, чтобы начать заново."
+        )
+        context.user_data.pop('current_vacancy_id', None)
+        context.user_data.pop('generated_cover_letter', None)
+        return ConversationHandler.END
+
+    if not vacancy_id:
+        await query.message.reply_text("Ошибка: не найдена информация о вакансии")
+        return ConversationHandler.END
+
+    # Ручной ввод письма
+    if action == 'write_cover':
+        await query.message.reply_text(
+            "Пожалуйста, напишите ваше сопроводительное письмо одним сообщением."
+        )
+        return WAITING_FOR_COVER_LETTER
+
+    # Генерация письма
+    resume_text = context.user_data.get('resume')
+    if not resume_text:
+        await query.message.reply_text(
+            "Сначала загрузите резюме через кнопку «📝 Загрузить резюме»."
+        )
+        return ConversationHandler.END
+
+    vacancy_details = get_vacancy_details(vacancy_id)
+    if not vacancy_details:
+        await query.message.reply_text("Ошибка: не найдена информация о вакансии")
+        return ConversationHandler.END
+
+    await query.message.reply_text("Генерирую сопроводительное письмо…")
+    cover_letter = generate_cover_letter(resume_text, vacancy_details)
+
+    if not cover_letter:
+        await query.message.reply_text(
+            "Не удалось сгенерировать сопроводительное письмо. Попробуйте написать его самостоятельно."
+        )
+        return WAITING_FOR_COVER_LETTER
+
+    await query.message.reply_text(
+        f"Сгенерированное сопроводительное письмо:\n\n{cover_letter}\n\n"
+        "Отправьте финальный вариант письма, если нужно изменить — отредактируйте."
+    )
+    context.user_data['generated_cover_letter'] = cover_letter
+    return WAITING_FOR_COVER_LETTER
+
+async def handle_cover_letter_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает введенное пользователем сопроводительное письмо"""
+    cover_letter = update.message.text
+    vacancy_id = context.user_data.get('current_vacancy_id')
+    
+    if not vacancy_id:
+        await update.message.reply_text("Ошибка: не найдена информация о вакансии")
+        return ConversationHandler.END
+        
+    # TODO: Реализовать отправку отклика на вакансию через HH.ru API
+    await update.message.reply_text(
+        "Спасибо! Ваше сопроводительное письмо сохранено. "
+        "Функция отправки отклика будет доступна в ближайшее время."
+    )
+    
+    # Очищаем данные о текущей вакансии
+    context.user_data.pop('current_vacancy_id', None)
+    context.user_data.pop('current_vacancy', None)
+    context.user_data.pop('generated_cover_letter', None)
+    
     return ConversationHandler.END
 
 def run_bot():
@@ -536,6 +698,7 @@ def run_bot():
                 CallbackQueryHandler(hh_auth, pattern="^hh_auth$"),
                 CallbackQueryHandler(upload_resume, pattern="^upload_resume$"),
                 CallbackQueryHandler(search_vacancies_handler, pattern="^search_vacancies$"),
+                CallbackQueryHandler(show_vacancy_details, pattern="^show_vacancy:"),
                 MessageHandler(filters.Document.ALL, hh_resume),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, hh_resume),
             ],
@@ -549,6 +712,10 @@ def run_bot():
             SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_salary)],
             PREFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, hh_prefs)],
             RESUME: [MessageHandler(~filters.COMMAND, hh_resume)],
+            WAITING_FOR_COVER_LETTER: [
+                CallbackQueryHandler(handle_cover_letter_choice, pattern=r"^(write_cover|generate_cover|cancel_cover)(:.+)?$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cover_letter_text),
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
         name="main_conversation",
