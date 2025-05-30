@@ -59,3 +59,6 @@ logs/
 data/chroma_resume/
 *.bin
 *.sqlite3
+
+# Local configuration
+config/hh_tokens.json

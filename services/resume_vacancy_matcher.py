@@ -38,8 +38,13 @@ except ImportError:  # библиотека может быть не устан�
     GigaChat = None  # type: ignore
     GigaChatEmbeddings = None  # type: ignore
 
+# Настройка логгера
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # --------------------------------------------------
 # Настраиваемые веса метрик
@@ -67,14 +72,14 @@ def _cosine(a: List[float], b: List[float]) -> float:
 # JSON‑схемы для function calling
 _RESUME_SCHEMA = {
     "name": "extract_resume",
-    "description": "Извлеки из резюме ключевые данные для мэтчинга.",
+    "description": "Извлеки из резюме ключевые данные для мэтчинга. Навыки должны быть конкретными технологиями, языками программирования, фреймворками, инструментами. Не включай общие слова, роли, уровни или описательные прилагательные.",
     "parameters": {
         "type": "object",
         "properties": {
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Ключевые навыки кандидата",
+                "description": "Список конкретных технических навыков (например: Python, React, Docker, PostgreSQL). Не включай общие слова как 'strong', 'manager', 'senior' и т.п.",
             },
             "experience_years": {
                 "type": "number",
@@ -95,11 +100,15 @@ _RESUME_SCHEMA = {
 
 _VACANCY_SCHEMA = {
     "name": "extract_vacancy",
-    "description": "Извлеки из описания вакансии структурированные данные.",
+    "description": "Извлеки из описания вакансии структурированные данные. Навыки должны быть конкретными технологиями, языками программирования, фреймворками, инструментами. Не включай общие слова, роли, уровни или описательные прилагательные.",
     "parameters": {
         "type": "object",
         "properties": {
-            "skills_required": {"type": "array", "items": {"type": "string"}},
+            "skills_required": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "Список конкретных технических навыков (например: Python, React, Docker, PostgreSQL). Не включай общие слова как 'strong', 'manager', 'senior' и т.п.",
+            },
             "experience_level": {"type": "string"},
             "schedule": {"type": "string"},
             "salary": {"type": "number"},
@@ -131,6 +140,9 @@ def _llm_extract(text: str, schema: Dict[str, Any]) -> Dict[str, Any]:
     ]
     try:
         res = llm.invoke(messages, functions=[schema])
+        # Логируем сырой ответ LLM
+        logger.info(f"Сырой ответ LLM для {schema.get('name', 'unknown')}:")
+        logger.info(str(res))
         args = res.additional_kwargs.get("function_call", {}).get("arguments")
         result = json.loads(args) if args else {}
         
@@ -276,11 +288,71 @@ def _evaluate_prefs(
 
 # --------------------------------------------------
 # Публичная функция мэтчинга
+def _extract_preferences(prefs_text: str) -> Dict[str, bool]:
+    """Извлекает предпочтения из текста."""
+    if not prefs_text:
+        return {}
+        
+    prefs = {}
+    lowered = prefs_text.lower()
+    
+    # Проверяем отрицательные предпочтения
+    for trig in _NEGATIVE_TRIGGERS:
+        if trig in lowered:
+            # слова после триггера до запятой/точки
+            pattern = rf"{trig}\s+([a-zа-я0-9+\-#._ ]{{2,}})"
+            for match in re.findall(pattern, lowered):
+                for token in match.replace(",", " ").split():
+                    if len(token) >= 3:
+                        prefs[token] = False  # False = не хочу
+    
+    # Проверяем положительные предпочтения (если есть "хочу", "нужен" и т.п.)
+    positive_triggers = ("хочу", "нужен", "нужна", "ищу", "ищем")
+    for trig in positive_triggers:
+        if trig in lowered:
+            pattern = rf"{trig}\s+([a-zа-я0-9+\-#._ ]{{2,}})"
+            for match in re.findall(pattern, lowered):
+                for token in match.replace(",", " ").split():
+                    if len(token) >= 3:
+                        prefs[token] = True  # True = хочу
+    
+    return prefs
+
+def _compare_titles(title1: str, title2: str, prefs: Dict[str, bool] = None) -> float:
+    """Сравнивает заголовки вакансий через эмбеддинги с учетом предпочтений."""
+    if not (GigaChatEmbeddings and os.getenv("GIGACHAT_TOKEN")):
+        return 0.0
+        
+    try:
+        emb = GigaChatEmbeddings(
+            credentials=os.getenv("GIGACHAT_TOKEN"), 
+            verify_ssl_certs=False
+        )
+        vec1 = emb.embed_query(title1)
+        vec2 = emb.embed_query(title2)
+        base_score = _cosine(vec1, vec2)
+        
+        # Если есть предпочтения, корректируем скор
+        if prefs:
+            title2_lower = title2.lower()
+            for pref, is_positive in prefs.items():
+                if pref in title2_lower:
+                    if is_positive:
+                        base_score *= 1.2  # Увеличиваем скор для желаемых направлений
+                    else:
+                        base_score *= 0.3  # Сильно снижаем скор для нежелательных направлений
+        
+        return base_score
+    except Exception as exc:
+        logger.warning("GigaChat embeddings failed for title comparison: %s", exc)
+        return 0.0
+
 def match_resume_to_vacancy(
     resume: Dict[str, Any],
     vacancy: Dict[str, Any],
     prefs_text: str | None = None,
     weights: Dict[str, float] | None = None,
+    search_title: str | None = None,
 ) -> Dict[str, Any]:
     """
     Сравнить резюме и вакансию, вернуть JSON с подробностями.
@@ -289,8 +361,31 @@ def match_resume_to_vacancy(
     :param vacancy: результат parse_vacancy()
     :param prefs_text: свободный текст пожеланий пользователя
     :param weights: кастомные веса метрик (иначе WEIGHTS)
+    :param search_title: заголовок искомой вакансии для сравнения
     """
     w = weights or WEIGHTS
+
+    # Извлекаем предпочтения
+    prefs = _extract_preferences(prefs_text or "")
+    
+    # --- Title comparison ---
+    title_score = 1.0
+    if search_title and vacancy.get("name"):
+        title_score = _compare_titles(search_title, vacancy["name"], prefs)
+        # Если есть нежелательные направления и они есть в заголовке, пропускаем
+        if any(not is_positive and pref in vacancy["name"].lower() 
+               for pref, is_positive in prefs.items()):
+            return {
+                "score": 0.0,
+                "title_score": 0.0,
+                "skills_score": 0.0,
+                "experience_ok": False,
+                "schedule_ok": False,
+                "prefs_ok": False,
+                "matched_skills": [],
+                "missing_skills": [],
+                "pref_violations": list(prefs.keys()),
+            }
 
     # --- Skills ---
     skills_score, matched, missing = _skill_score(
@@ -327,14 +422,16 @@ def match_resume_to_vacancy(
 
     # --- Итог ---
     final = (
-        skills_score * w["skills"]
-        + exp_score * w["experience"]
-        + sched_score * w["schedule"]
-        + prefs_score * w["prefs"]
+        title_score * 0.3 +  # 30% вес для заголовка
+        skills_score * w["skills"] * 0.7 +  # 70% от веса навыков
+        exp_score * w["experience"] +
+        sched_score * w["schedule"] +
+        prefs_score * w["prefs"]
     )
 
     result = {
         "score": round(final, 3),
+        "title_score": round(title_score, 3),
         "skills_score": round(skills_score, 3),
         "experience_ok": bool(exp_score),
         "schedule_ok": bool(sched_score),
@@ -345,7 +442,7 @@ def match_resume_to_vacancy(
     }
     
     # Логируем результаты сравнения
-    logger.info("Результаты сравнения резюме и вакансии:")
-    logger.info(json.dumps(result, indent=2, ensure_ascii=False))
+    # logger.info("Результаты сравнения резюме и вакансии:")
+    # logger.info(json.dumps(result, indent=2, ensure_ascii=False))
     
     return result

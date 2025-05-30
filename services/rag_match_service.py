@@ -26,6 +26,7 @@ from langchain_chroma import Chroma
 from langchain_gigachat.chat_models import GigaChat
 from langchain_gigachat.embeddings.gigachat import GigaChatEmbeddings
 from dotenv import load_dotenv
+from services.vector_store import index_resume
 
 # Отключаем предупреждения LangSmith
 warnings.filterwarnings("ignore", category=UserWarning, module="langsmith")
@@ -144,9 +145,17 @@ class RAGService:
 rag_service = RAGService()
 
 # Для обратной совместимости
-def index_resume_if_needed(resume_text: str, user_id: str | int) -> str:
-    """Алиас для обратной совместимости"""
-    return rag_service.index_resume_if_needed(resume_text, user_id)
+def index_resume_if_needed(resume_text: str, user_id: int) -> str:
+    """
+    Индексирует резюме, если оно еще не проиндексировано.
+    
+    :param resume_text: Текст резюме
+    :param user_id: ID пользователя
+    :return: ID резюме в хранилище
+    """
+    # TODO: Реализовать проверку на существование резюме
+    # Пока просто индексируем
+    return index_resume(resume_text, user_id)
 
 def ask_resume(question: str, resume_id: str, k: int = 6) -> str:
     """Алиас для обратной совместимости"""
