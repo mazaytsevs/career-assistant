@@ -23,7 +23,13 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from config.logger import setup_logger
 from services.message_service import send_message
-from services.head_hunter import search_vacancies, get_resume_list, get_resume_details, get_vacancy_details
+from services.head_hunter import (
+    search_vacancies,
+    get_resume_list,
+    get_resume_details,
+    get_vacancy_details,
+    apply_for_vacancy,
+)
 from services.resume_vacancy_matcher import match_resume_to_vacancy
 from services.vector_store import index_resume, search_similar_resumes
 from config.hh_config import (
@@ -54,6 +60,7 @@ logger = setup_logger(__name__)
 WAITING_FOR_RESUME, WAITING_FOR_HH_AUTH_CODE = range(2)          # 0, 1
 KEYWORDS, EXPERIENCE, EMPLOYMENT, SCHEDULE, SALARY, PREFS, RESUME = range(2, 9)  # 2–8
 WAITING_FOR_COVER_LETTER = 9  # Новое состояние для ожидания сопроводительного письма
+WAITING_FOR_APPLY_CHOICE = 10  # ожидание выбора, как откликнуться
 
 # Читаемые лейблы → значения, которые ждёт HH API
 EXPERIENCE_MAP = {
@@ -425,6 +432,8 @@ async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if resumes:
             # Используем первое резюме для поиска похожих вакансий
             hh_resume_id = resumes.items[0]["id"]
+            # Сохраняем HH resume ID для откликов
+            context.user_data["hh_resume_id"] = hh_resume_id
             vacancies = search_vacancies(
                 text=context.user_data["keywords"],
                 experience=context.user_data["experience"],
@@ -561,6 +570,7 @@ async def show_vacancy_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Сохраняем ID вакансии
     context.user_data["current_vacancy_id"] = vacancy_id
+    context.user_data["current_vacancy_url"] = vacancy.get("alternate_url")
 
     # Собираем текст
     name = escape_markdown(vacancy.get("name", "Без названия"), version=2)
@@ -664,22 +674,81 @@ async def handle_cover_letter_text(update: Update, context: ContextTypes.DEFAULT
     """Обрабатывает введенное пользователем сопроводительное письмо"""
     cover_letter = update.message.text
     vacancy_id = context.user_data.get('current_vacancy_id')
-    
+
     if not vacancy_id:
         await update.message.reply_text("Ошибка: не найдена информация о вакансии")
         return ConversationHandler.END
-        
-    # TODO: Реализовать отправку отклика на вакансию через HH.ru API
+
+    # Сохраняем письмо
+    context.user_data['final_cover_letter'] = cover_letter
+
+    # Кнопки выбора
+    vacancy_url = context.user_data.get('current_vacancy_url', '')
+    keyboard = [
+        [InlineKeyboardButton("🖐 Откликнусь сам", callback_data=f"apply_manual:{vacancy_id}")],
+        [InlineKeyboardButton("🤖 Откликнуться автоматически", callback_data=f"apply_auto:{vacancy_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="apply_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        "Спасибо! Ваше сопроводительное письмо сохранено. "
-        "Функция отправки отклика будет доступна в ближайшее время."
+        "Сопроводительное письмо сохранено.\n"
+        "Как поступим с откликом?",
+        reply_markup=reply_markup
     )
-    
-    # Очищаем данные о текущей вакансии
-    context.user_data.pop('current_vacancy_id', None)
-    context.user_data.pop('current_vacancy', None)
-    context.user_data.pop('generated_cover_letter', None)
-    
+    return WAITING_FOR_APPLY_CHOICE
+
+
+# --- Вспомогательная функция очистки apply context ---
+def _clear_apply_context(context: ContextTypes.DEFAULT_TYPE):
+    """Очищает временные данные, связанные с текущим откликом"""
+    for key in ("current_vacancy_id", "current_vacancy_url",
+                "generated_cover_letter", "final_cover_letter"):
+        context.user_data.pop(key, None)
+
+
+# --- Новый обработчик выбора способа отклика ---
+async def handle_apply_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает выбор способа отклика"""
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data.split(':')[0]          # apply_manual / apply_auto / apply_cancel
+    vacancy_id = context.user_data.get('current_vacancy_id')
+    resume_id = context.user_data.get('hh_resume_id')
+    cover_letter = context.user_data.get('final_cover_letter')
+    vacancy_url = context.user_data.get('current_vacancy_url', '')
+
+    # Отмена
+    if action == 'apply_cancel':
+        await query.message.reply_text("Действие отменено. Используйте /start для нового поиска.")
+        _clear_apply_context(context)
+        return ConversationHandler.END
+
+    # Ручной отклик
+    if action == 'apply_manual':
+        if vacancy_url:
+            await query.message.reply_text(
+                f"Откликнись вручную по ссылке:\n{vacancy_url}"
+            )
+        else:
+            await query.message.reply_text("Не могу найти ссылку на вакансию 😔")
+        _clear_apply_context(context)
+        return ConversationHandler.END
+
+    # Автоматический отклик
+    if action == 'apply_auto':
+        print(context.user_data["resume_id"])
+        success = apply_for_vacancy(vacancy_id, resume_id, cover_letter)
+        if success:
+            await query.message.reply_text("✅ Отклик успешно отправлен!")
+        else:
+            await query.message.reply_text("❌ Не удалось отправить отклик автоматически.")
+        _clear_apply_context(context)
+        return ConversationHandler.END
+
+    # На всякий случай
+    await query.message.reply_text("Неизвестное действие.")
     return ConversationHandler.END
 
 def run_bot():
@@ -715,6 +784,9 @@ def run_bot():
             WAITING_FOR_COVER_LETTER: [
                 CallbackQueryHandler(handle_cover_letter_choice, pattern=r"^(write_cover|generate_cover|cancel_cover)(:.+)?$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cover_letter_text),
+            ],
+            WAITING_FOR_APPLY_CHOICE: [
+                CallbackQueryHandler(handle_apply_choice, pattern=r"^(apply_manual|apply_auto|apply_cancel)(:.+)?$"),
             ],
         },
         fallbacks=[CommandHandler("start", start)],

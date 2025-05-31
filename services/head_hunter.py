@@ -191,6 +191,47 @@ def get_resume_details(resume_id: str) -> Dict:
     response.raise_for_status()
     return response.json()
 
+def apply_for_vacancy(vacancy_id: str, resume_id: str, message: str = None) -> bool:
+    """
+    Отправляет отклик на вакансию.
+    
+    :param vacancy_id: ID вакансии
+    :param resume_id: ID резюме
+    :param message: Сопроводительное письмо (опционально)
+    :return: True если отклик успешно отправлен, False в случае ошибки
+    """
+    try:
+        
+        url = f"{HH_API_BASE_URL}/negotiations"
+        headers = get_auth_headers(get_access_token())
+        
+        data = {
+            'vacancy_id': vacancy_id,
+            'resume_id': resume_id
+        }
+        
+        if message:
+            data['message'] = message
+            
+        # Отправляем форму multipart/form-data
+        files = {
+            "vacancy_id": (None, vacancy_id),
+            "resume_id": (None, resume_id),
+            "message": (None, message or "")
+        }
+        response = httpx.post(url, headers=headers, files=files)
+        
+        if response.status_code == 201:
+            logger.info(f"Успешный отклик на вакансию {vacancy_id} с резюме {resume_id}")
+            return True
+        else:
+            logger.error(f"Ошибка при отклике на вакансию: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as exc:
+        logger.error(f"Ошибка при отклике на вакансию: {exc}")
+        return False
+
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
