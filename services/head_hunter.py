@@ -12,8 +12,9 @@ from config.hh_config import (
     check_hh_config,
     get_access_token,
 )
+from config.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 def get_vacancy_details(vacancy_id: int | str) -> Dict:
     """
@@ -24,6 +25,76 @@ def get_vacancy_details(vacancy_id: int | str) -> Dict:
     response = httpx.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
+
+def auto_apply_vacancies(
+    resume_id: int | str,
+    keywords: str,
+    count: int,
+    experience: str | None,
+    employment: str | None,
+    schedule: str | None,
+    salary: int | None,
+    prefs: str | None,
+    cover_letter: str | None
+) -> bool:
+    """
+    Настраивает автоотклик на вакансии с заданными параметрами.
+    
+    :param resume_id: ID резюме пользователя
+    :param keywords: Ключевые слова для поиска
+    :param count: Количество вакансий для отклика
+    :param experience: Опыт работы
+    :param employment: Тип занятости
+    :param schedule: График работы
+    :param salary: Минимальная зарплата
+    :param prefs: Предпочтения пользователя
+    :param cover_letter: Сопроводительное письмо
+    :return: True если автоотклик успешно настроен, False в случае ошибки
+    """
+    # Логируем все собранные данные
+    
+    logger.info("=== Собранные данные для автоотклика ===")
+    logger.info(f"айди вакансии: {resume_id}")
+
+    logger.info(f"Ключевые слова: {keywords}")
+    logger.info(f"Опыт работы: {experience}")
+    logger.info(f"Тип занятости: {employment}")
+    logger.info(f"График работы: {schedule}")
+    logger.info(f"Зарплата: {salary}")
+    logger.info(f"Предпочтения: {prefs}")
+    logger.info(f"Сопроводительное письмо: {cover_letter}")
+    logger.info(f"Количество вакансий: {count}")
+    logger.info("=======================================")
+
+    pages = [0]
+    per_page = []
+
+    if count > 100 and count <= 200:
+        pages.append(1)
+        per_page.append(100)
+        per_page.append(count - 100)
+    elif count <= 200:
+        per_page.append(count)
+
+
+    print(f"pages: {pages}")
+
+    for page in pages:
+        vacancies = get_similar_vacancies(
+            resume_id=resume_id,
+            text=keywords,
+            experience=experience,
+            employment=employment,
+            schedule=schedule,
+            salary=salary,
+            page=page,
+            per_page=per_page[page],
+        )
+        print(f"vacancies: {vacancies['items']}")
+        for vacancy in vacancies['items']:
+            apply_for_vacancy(vacancy['id'], resume_id, cover_letter)
+
+    return True
 
 def get_similar_vacancies(
     resume_id: str,

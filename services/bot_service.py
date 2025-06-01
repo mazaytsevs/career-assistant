@@ -29,6 +29,7 @@ from services.head_hunter import (
     get_resume_details,
     get_vacancy_details,
     apply_for_vacancy,
+    auto_apply_vacancies,
 )
 from services.resume_vacancy_matcher import match_resume_to_vacancy
 from services.vector_store import index_resume, search_similar_resumes
@@ -57,10 +58,15 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logger = setup_logger(__name__)
 
+RESUME_ID = os.getenv("RESUME_ID")
+
+
 WAITING_FOR_RESUME, WAITING_FOR_HH_AUTH_CODE = range(2)          # 0, 1
 KEYWORDS, EXPERIENCE, EMPLOYMENT, SCHEDULE, SALARY, PREFS, RESUME = range(2, 9)  # 2–8
 WAITING_FOR_COVER_LETTER = 9  # Новое состояние для ожидания сопроводительного письма
-WAITING_FOR_APPLY_CHOICE = 10  # ожидание выбора, как откликнуться
+WAITING_FOR_APPLY_CHOICE = 10
+WAITING_FOR_AUTO_APPLY_COVER = 11  # Ожидание сопроводительного письма для автоотклика
+WAITING_FOR_AUTO_APPLY_COUNT = 12  # Ожидание количества вакансий для автоотклика
 
 # Читаемые лейблы → значения, которые ждёт HH API
 EXPERIENCE_MAP = {
@@ -107,6 +113,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Вызван обработчик /start")
     keyboard = [
         [InlineKeyboardButton("🔍 Поиск вакансий", callback_data="search_vacancies")],
+        [InlineKeyboardButton("🤖 Автоотклик", callback_data="auto_apply")],
         [InlineKeyboardButton("📝 Загрузить резюме", callback_data="upload_resume")],
         [InlineKeyboardButton("🔗 Авторизация в HH.ru", callback_data="hh_auth")]
     ]
@@ -268,6 +275,20 @@ async def search_vacancies_handler(update: Update, context: ContextTypes.DEFAULT
     )
     return KEYWORDS
 
+async def auto_apply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик автоотклика"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Устанавливаем флаг автоотклика
+    context.user_data["is_auto_apply"] = True
+    
+    await query.edit_message_text(
+        "Давай настроим автоотклик!\n"
+        "Сначала напиши ключевые слова, например: Node.js developer"
+    )
+    return KEYWORDS
+
 async def set_bot_commands(app: Application):
     """Регистрируем список команд, чтобы они появились в меню Telegram‑клиента."""
     await app.bot.set_my_commands(
@@ -363,17 +384,21 @@ async def hh_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def hh_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик ввода предпочтений"""
-    prefs = update.message.text or ""
-    context.user_data["prefs"] = "" if prefs.lower().strip() == "нет" else prefs
-    text = (
-        "Пришли своё резюме текстом или файлом. "
-        "Если хочешь пропустить шаг — напиши «нет»."
-    )
-    await update.message.reply_text(
-        escape_markdown(text, version=2),
-        parse_mode="MarkdownV2"
-    )
-    return RESUME
+    context.user_data["prefs"] = update.message.text.strip()
+    
+    # Проверяем, находимся ли мы в режиме автоотклика
+    if context.user_data.get("is_auto_apply"):
+        await update.message.reply_text(
+            "Напиши сопроводительное письмо, которое будет использоваться для всех откликов.\n"
+            "Или напиши 'нет', если хочешь откликаться без сопроводительного письма."
+        )
+        return WAITING_FOR_AUTO_APPLY_COVER
+    else:
+        await update.message.reply_text(
+            "Загрузи резюме в формате PDF или TXT, или напиши его текст.\n"
+            "Если нет резюме — напиши «нет»."
+        )
+        return RESUME
 
 async def hh_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик загрузки резюме"""
@@ -613,6 +638,7 @@ async def show_vacancy_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="MarkdownV2")
     return WAITING_FOR_COVER_LETTER
+
 async def handle_cover_letter_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обрабатывает выбор способа написания сопроводительного письма или отмену"""
     query = update.callback_query
@@ -751,6 +777,58 @@ async def handle_apply_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.message.reply_text("Неизвестное действие.")
     return ConversationHandler.END
 
+async def handle_auto_apply_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик ввода сопроводительного письма для автоотклика"""
+    cover_letter = update.message.text.strip()
+    if cover_letter.lower() != "нет":
+        context.user_data["auto_apply_cover_letter"] = cover_letter
+    
+    keyboard = [
+        ["2", "5"],
+        ["25", "50"],
+        ["200"]
+    ]
+    await update.message.reply_text(
+        "На сколько вакансий откликнуться?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard, resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return WAITING_FOR_AUTO_APPLY_COUNT
+
+async def handle_auto_apply_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик выбора количества вакансий для автоотклика"""
+    try:
+        count = int(update.message.text.strip())
+        if count not in [2, 5, 25, 50, 200]:
+            raise ValueError("Invalid count")
+        context.user_data["auto_apply_count"] = count
+    except ValueError:
+        await update.message.reply_text(
+            "Пожалуйста, выберите одно из предложенных значений: 2, 5, 25, 50 или 200"
+        )
+        return WAITING_FOR_AUTO_APPLY_COUNT
+
+    # Вызываем функцию автоотклика с собранными данными
+    success = auto_apply_vacancies(
+        resume_id=RESUME_ID,
+        keywords=context.user_data.get('keywords'),
+        count=context.user_data.get('auto_apply_count'),
+        experience=context.user_data.get('experience'),
+        employment=context.user_data.get('employment'),
+        schedule=context.user_data.get('schedule'),
+        salary=context.user_data.get('salary'),
+        prefs=context.user_data.get('prefs'),
+        cover_letter=context.user_data.get('auto_apply_cover_letter')
+    )
+
+    if success:
+        await update.message.reply_text("✅ Автоотклик успешно настроен!")
+    else:
+        await update.message.reply_text("❌ Произошла ошибка при настройке автоотклика")
+
+    return ConversationHandler.END
+
 def run_bot():
     """Запуск бота с автоматическим управлением циклом событий"""
     check_environment()
@@ -767,6 +845,7 @@ def run_bot():
                 CallbackQueryHandler(hh_auth, pattern="^hh_auth$"),
                 CallbackQueryHandler(upload_resume, pattern="^upload_resume$"),
                 CallbackQueryHandler(search_vacancies_handler, pattern="^search_vacancies$"),
+                CallbackQueryHandler(auto_apply_handler, pattern="^auto_apply$"),
                 CallbackQueryHandler(show_vacancy_details, pattern="^show_vacancy:"),
                 MessageHandler(filters.Document.ALL, hh_resume),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, hh_resume),
@@ -787,6 +866,12 @@ def run_bot():
             ],
             WAITING_FOR_APPLY_CHOICE: [
                 CallbackQueryHandler(handle_apply_choice, pattern=r"^(apply_manual|apply_auto|apply_cancel)(:.+)?$"),
+            ],
+            WAITING_FOR_AUTO_APPLY_COVER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auto_apply_cover),
+            ],
+            WAITING_FOR_AUTO_APPLY_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auto_apply_count),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
